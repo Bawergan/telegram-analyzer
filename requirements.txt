@@ -1,0 +1,10 @@
+# requirements.txt
+
+# Core
+sqlalchemy
+pydantic
+pydantic-settings
+
+# Testing
+pytest
+pytest-anyio
