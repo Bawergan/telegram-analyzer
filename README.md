@@ -74,11 +74,11 @@ MEDIA_STORAGE_ROOT="media_storage"
 ## Использование
 
 **Шаг 1: Подготовка данных**
-Создайте корневую папку (например, `my_telegram_exports`) и поместите в нее папки с вашими экспортами из Telegram. Скрипт ожидает, что в каждой такой папке будет файл `result.json` и сопутствующие медиафайлы.
+Создайте корневую папку (например, `telegram_json_exports`) и поместите в нее папки с вашими экспортами из Telegram. Скрипт ожидает, что в каждой такой папке будет файл `result.json` и сопутствующие медиафайлы.
 
 Пример структуры ваших данных:
 ```
-/my_telegram_exports/
+/telegram_json_exports/
 ├── chat_with_friend/
 │   ├── photos/
 │   │   └── photo_123.jpg
@@ -91,10 +91,10 @@ MEDIA_STORAGE_ROOT="media_storage"
 ```
 
 **Шаг 2: Запуск импорта**
-Выполните команду в терминале, указав путь к вашей корневой папке с экспортами (`my_telegram_exports`):
+Выполните команду в терминале, указав путь к вашей корневой папке с экспортами (`telegram_json_exports`):
 
 ```bash
-python run_importer.py --source /path/to/my_telegram_exports
+python run_importer.py --source /path/to/telegram_json_exports
 ```
 
 Скрипт начнет обработку. Вы увидите логи в консоли, информирующие о прогрессе. После завершения:
