@@ -60,7 +60,7 @@ class TestComprehensiveAndOptimizedDatabase:
 
     def test_cascade_delete(self, db_session: Session, tmp_path: Path):
         sample_json = {"id": 505, "messages": [{"id": 40, "type": "message", "from_id": "ud", "from": "D", "text": ""}]}
-        chat = validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
+        chat, _ = validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
         db_session.delete(chat)
         db_session.commit()
         assert db_session.query(Message).count() == 0
@@ -83,11 +83,11 @@ class TestComprehensiveAndOptimizedDatabase:
     
     def test_idempotency_skips_unchanged_messages(self, db_session: Session, tmp_path: Path):
         sample_json = {"id": 707, "messages": [{"id": i, "type": "message", "from_id": f"u{i % 2}", "from": "User"} for i in range(10)]}
-        validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
+        _, count1 = validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
+        assert count1 == 10
         assert db_session.query(Message).count() == 10
-        with patch.object(db_session, 'add_all', wraps=db_session.add_all) as mock_add_all:
-             validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
-             mock_add_all.assert_not_called()
+        _, count2 = validate_and_load_from_dict(db_session, sample_json, str(tmp_path), str(tmp_path))
+        assert count2 == 0 # Новых сообщений не должно быть добавлено
         assert db_session.query(Message).count() == 10
 
     def test_raw_text_storage(self, db_session: Session, tmp_path: Path):
@@ -136,15 +136,15 @@ class TestComprehensiveAndOptimizedDatabase:
 
     def test_loading_empty_messages_list(self, db_session: Session, tmp_path: Path):
         empty_json = {"id": 222, "name": "Empty Chat", "messages": []}
-        chat = validate_and_load_from_dict(db_session, empty_json, str(tmp_path), str(tmp_path))
+        chat, _ = validate_and_load_from_dict(db_session, empty_json, str(tmp_path), str(tmp_path))
         assert chat is not None and chat.telegram_id == 222
         assert db_session.query(Message).count() == 0 and db_session.query(User).count() == 0
 
     @patch('database.logging.error')
     def test_invalid_json_validation_fails_gracefully(self, mock_logging_error: MagicMock, db_session: Session, tmp_path: Path):
         invalid_json = {"id": 444, "name": "Invalid Chat"}
-        result = validate_and_load_from_dict(db_session, invalid_json, str(tmp_path), str(tmp_path))
-        assert result is None and db_session.query(Chat).count() == 0
+        result, count = validate_and_load_from_dict(db_session, invalid_json, str(tmp_path), str(tmp_path))
+        assert result is None and count == 0 and db_session.query(Chat).count() == 0
         mock_logging_error.assert_called_once()
     
     # --- Группа 3: Upsert-логика ---
@@ -170,13 +170,13 @@ class TestComprehensiveAndOptimizedDatabase:
     def test_upsert_logic_merges_new_and_skips_existing(self, db_session: Session, tmp_path: Path):
         chat_id = 456
         initial_json = {"id": chat_id, "messages": [{"id": i, "type": "message", "text": f"Msg {i}"} for i in range(1, 11)]}
-        validate_and_load_from_dict(db_session, initial_json, str(tmp_path), str(tmp_path))
-        assert db_session.query(Message).count() == 10
+        _, count1 = validate_and_load_from_dict(db_session, initial_json, str(tmp_path), str(tmp_path))
+        assert db_session.query(Message).count() == 10 and count1 == 10
         
         overlapping_json = {"id": chat_id, "messages": [{"id": i, "type": "message", "text": f"Msg {i}"} for i in range(5, 16)]}
-        validate_and_load_from_dict(db_session, overlapping_json, str(tmp_path), str(tmp_path))
+        _, count2 = validate_and_load_from_dict(db_session, overlapping_json, str(tmp_path), str(tmp_path))
         
-        assert db_session.query(Message).count() == 15
+        assert db_session.query(Message).count() == 15 and count2 == 5
         all_ids = {msg.telegram_id for msg in db_session.query(Message).all()}
         assert all_ids == set(range(1, 16))
 
@@ -207,6 +207,7 @@ class TestComprehensiveAndOptimizedDatabase:
         export_root = tmp_path / "export_data"
         media_storage_root = tmp_path / "central_storage"
         export_root.mkdir()
+        media_storage_root.mkdir() # В реальном коде это делает run_importer
         (export_root / "photos").mkdir()
         
         dummy_file_rel_path = "photos/my_photo.jpg"
@@ -237,6 +238,7 @@ class TestComprehensiveAndOptimizedDatabase:
         export_root = tmp_path / "export_data"
         media_storage_root = tmp_path / "central_storage"
         export_root.mkdir()
+        media_storage_root.mkdir()
 
         json_data = {
             "id": 111, "messages": [
@@ -250,3 +252,37 @@ class TestComprehensiveAndOptimizedDatabase:
         msg_from_db = db_session.query(Message).one()
         assert msg_from_db.stored_media_path is None
         mock_logging_warning.assert_called_once()
+
+    def test_chat_metadata_updates_on_reimport(self, db_session: Session, tmp_path: Path):
+        """Проверяет, что имя и тип чата обновляются при повторном импорте."""
+        chat_id = 999
+        initial_json = {"id": chat_id, "name": "Project A", "type": "private_supergroup", "messages": []}
+        validate_and_load_from_dict(db_session, initial_json, str(tmp_path), str(tmp_path))
+        
+        chat_from_db = db_session.query(Chat).filter_by(telegram_id=chat_id).one()
+        assert chat_from_db.name == "Project A" and chat_from_db.type == "private_supergroup"
+        assert db_session.query(Chat).count() == 1
+
+        updated_json = {"id": chat_id, "name": "Project B", "type": "public_supergroup", "messages": []}
+        validate_and_load_from_dict(db_session, updated_json, str(tmp_path), str(tmp_path))
+
+        assert db_session.query(Chat).count() == 1
+        chat_from_db_updated = db_session.query(Chat).filter_by(telegram_id=chat_id).one()
+        assert chat_from_db_updated.name == "Project B" and chat_from_db_updated.type == "public_supergroup"
+
+    def test_user_name_updates_on_reimport(self, db_session: Session, tmp_path: Path):
+        """Проверяет, что имя пользователя обновляется при повторном импорте."""
+        chat_id = 888
+        user_id = "user123"
+
+        initial_json = {"id": chat_id, "messages": [{"id": 1, "type": "message", "from": "OldName", "from_id": user_id}]}
+        validate_and_load_from_dict(db_session, initial_json, str(tmp_path), str(tmp_path))
+        assert db_session.query(User).filter_by(telegram_id=user_id).one().name == "OldName"
+        assert db_session.query(User).count() == 1
+
+        updated_json = {"id": chat_id, "messages": [{"id": 2, "type": "message", "from": "NewName", "from_id": user_id}]}
+        validate_and_load_from_dict(db_session, updated_json, str(tmp_path), str(tmp_path))
+
+        assert db_session.query(User).count() == 1
+        assert db_session.query(User).filter_by(telegram_id=user_id).one().name == "NewName"
+        assert db_session.query(Message).count() == 2

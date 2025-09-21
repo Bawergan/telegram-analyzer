@@ -4,6 +4,7 @@
 sqlalchemy
 pydantic
 pydantic-settings
+python-dotenv
 
 # Testing
 pytest

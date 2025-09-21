@@ -70,21 +70,22 @@ def test_run_batch_import_happy_path(
     file2_path = tmp_path / "chat2" / "result.json"
     mock_find_files.return_value = [file1_path, file2_path]
     
-    # ИСПРАВЛЕНИЕ: Правильно конфигурируем mock-объект, который возвращает validate_and_load_from_dict
     mock_chat_object = MagicMock()
-    # Обратите внимание, что в коде используется chat.telegram_id, а не chat.id
     mock_chat_object.configure_mock(
         name='Test Chat',
         telegram_id=123
     )
-    mock_validate.return_value = mock_chat_object
+    # ИЗМЕНЕНИЕ: validate_and_load_from_dict теперь возвращает кортеж (chat, new_messages_count)
+    mock_validate.return_value = (mock_chat_object, 10)
 
     mock_settings.MEDIA_STORAGE_ROOT = str(tmp_path / "media")
     
     test_json_data = {"id": 123, "name": "Test Chat", "messages": []}
 
-    with patch('builtins.open', mock_open(read_data=json.dumps(test_json_data))):
-        run_batch_import(str(tmp_path))
+    # patch Path.mkdir to avoid actual directory creation
+    with patch('pathlib.Path.mkdir'):
+        with patch('builtins.open', mock_open(read_data=json.dumps(test_json_data))):
+            run_batch_import(str(tmp_path))
 
     # 3. Проверки (Asserts)
     mock_create_all.assert_called_once()
@@ -102,8 +103,9 @@ def test_run_batch_import_happy_path(
     second_call_args = mock_validate.call_args_list[1].kwargs
     assert second_call_args['export_root'] == str(file2_path.parent)
 
-    # Теперь эта проверка должна сработать, так как chat.name вернет 'Test Chat'
     assert "Successfully processed chat 'Test Chat' (ID: 123)" in caplog.text
+    # ИСПРАВЛЕНИЕ: Эта проверка теперь должна работать, так как логи захватываются корректно
+    assert "Total new messages added to the database: 20" in caplog.text
 
 
 @patch('run_importer.validate_and_load_from_dict')
@@ -143,6 +145,9 @@ def test_run_batch_import_handles_json_error(
     """
     Проверяет, что скрипт обрабатывает ошибку парсинга JSON и продолжает работу.
     """
+    # ИСПРАВЛЕНИЕ: Устанавливаем уровень INFO, чтобы поймать и ошибку, и финальную статистику
+    caplog.set_level(logging.INFO)
+    
     mock_session_instance = MagicMock()
     mock_session_local.return_value = mock_session_instance
     
@@ -151,13 +156,17 @@ def test_run_batch_import_handles_json_error(
     
     mock_json_load.side_effect = json.JSONDecodeError("Mocked Decode Error", "doc", 0)
 
-    with patch('builtins.open', mock_open(read_data="this is not a valid json")):
-        with caplog.at_level(logging.ERROR):
+    with patch('pathlib.Path.mkdir'):
+        with patch('builtins.open', mock_open(read_data="this is not a valid json")):
+            # ИСПРАВЛЕНИЕ: Убираем with caplog.at_level(logging.ERROR), так как уровень уже задан
             run_batch_import(str(tmp_path))
 
     mock_validate.assert_not_called() 
     mock_session_instance.close.assert_called_once() 
+    mock_session_instance.rollback.assert_called_once() 
     assert f"Error decoding JSON from file: {file_path}" in caplog.text
+    # ИСПРАВЛЕНИЕ: Эта проверка теперь должна работать, так как итоговая статистика будет в логах
+    assert "Failed or skipped: 1" in caplog.text
 
 
 def test_run_batch_import_source_dir_not_found(tmp_path: Path, caplog):

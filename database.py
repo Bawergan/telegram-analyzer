@@ -1,4 +1,4 @@
-# database.py (обновленная версия без тестов)
+# database.py
 
 # --- 0. Импорты и конфигурация ---
 import logging
@@ -31,6 +31,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BASE_DIR = Path(__file__).resolve().parent
 
 class Settings(BaseSettings):
+    """
+    Класс для управления настройками приложения с использованием Pydantic.
+    Загружает конфигурацию из .env файла или использует значения по умолчанию.
+    """
     DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'telegram_archive.db'}"
     MEDIA_STORAGE_ROOT: str = str(BASE_DIR / "media_storage")
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra='ignore')
@@ -164,13 +168,36 @@ class Reaction(Base):
 
 # --- 5. Интерфейс базы данных и логика ETL ---
 def get_or_create(session: Session, model: Type[T], defaults: Optional[dict] = None, **kwargs) -> Tuple[T, bool]:
+    """
+    Находит существующий экземпляр модели или создает новый.
+
+    Args:
+        session: Сессия SQLAlchemy.
+        model: Класс ORM-модели.
+        defaults: Словарь со значениями для создания нового экземпляра.
+        **kwargs: Аргументы для поиска существующего экземпляра.
+
+    Returns:
+        Кортеж (instance, created), где 'created' - bool флаг, был ли экземпляр создан.
+    """
     instance = session.query(model).filter_by(**kwargs).one_or_none()
-    if instance: return instance, False
-    instance = model(**kwargs, **(defaults or {}))
+    if instance:
+        return instance, False
+    defaults = defaults or {}
+    instance = model(**kwargs, **defaults)
     session.add(instance)
     return instance, True
 
 def _extract_text_and_entities(msg: MessageSchema) -> Tuple[str, List[TextEntitySchema]]:
+    """
+    Извлекает текстовое содержимое и text_entities из сложной структуры поля 'text'.
+
+    Args:
+        msg: Pydantic-схема сообщения (MessageSchema).
+
+    Returns:
+        Кортеж (text_content, text_entities_list).
+    """
     if not msg.text_entities and isinstance(msg.text, list):
         try:
             entities_from_text = [item for item in msg.text if isinstance(item, dict)]
@@ -186,6 +213,42 @@ def _extract_text_and_entities(msg: MessageSchema) -> Tuple[str, List[TextEntity
         text_content = str(msg.text) if msg.text else ""
     return text_content, text_entities
 
+def _handle_media_file(
+    message_orm: Message,
+    msg_schema: MessageSchema,
+    chat_telegram_id: int,
+    export_root: str,
+    media_storage_root: str
+):
+    """
+    Обрабатывает медиафайл, связанный с сообщением: копирует его в центральное
+    хранилище и сохраняет новый путь в ORM-объекте.
+
+    Args:
+        message_orm: ORM-объект сообщения для обновления.
+        msg_schema: Pydantic-схема сообщения, содержащая информацию о файле.
+        chat_telegram_id: Telegram ID чата для формирования уникального имени файла.
+        export_root: Корневая директория конкретного экспорта.
+        media_storage_root: Корневая директория центрального медиахранилища.
+    """
+    if not msg_schema.file:
+        return
+
+    source_path = Path(export_root) / msg_schema.file
+    if source_path.exists():
+        extension = source_path.suffix
+        new_filename = f"{chat_telegram_id}_{msg_schema.id}{extension}"
+        dest_path = Path(media_storage_root) / new_filename
+        
+        try:
+            shutil.copy2(source_path, dest_path)
+            message_orm.stored_media_path = new_filename
+        except Exception:
+            logging.error(f"Failed to copy file {source_path} to {dest_path}", exc_info=True)
+    else:
+        logging.warning(f"Media file not found for message {msg_schema.id}: {source_path}")
+
+
 def _populate_message_from_schema(
     message_orm: Message,
     msg_schema: MessageSchema,
@@ -193,7 +256,16 @@ def _populate_message_from_schema(
     export_root: str,
     media_storage_root: str
 ):
-    """Наполняет ORM-объект Message данными из Pydantic-схемы, включая обработку медиафайлов."""
+    """
+    Наполняет ORM-объект Message данными из Pydantic-схемы, включая обработку медиафайлов.
+
+    Args:
+        message_orm: ORM-объект сообщения (новый или существующий).
+        msg_schema: Pydantic-схема сообщения с исходными данными.
+        chat_telegram_id: Telegram ID чата.
+        export_root: Путь к директории с исходным экспортом.
+        media_storage_root: Путь к центральному хранилищу медиафайлов.
+    """
     text_content, text_entities_schemas = _extract_text_and_entities(msg_schema)
     
     message_orm.text = text_content
@@ -211,30 +283,42 @@ def _populate_message_from_schema(
     message_orm.text_entities = [TextEntity(type=e.type, text=e.text) for e in text_entities_schemas]
     message_orm.reactions = [Reaction(emoji=r.emoji, count=r.count) for r in msg_schema.reactions or []]
 
-    if msg_schema.file:
-        source_path = Path(export_root) / msg_schema.file
-        if source_path.exists():
-            extension = source_path.suffix
-            new_filename = f"{chat_telegram_id}_{msg_schema.id}{extension}"
-            
-            storage_path = Path(media_storage_root)
-            storage_path.mkdir(parents=True, exist_ok=True)
-            
-            dest_path = storage_path / new_filename
-            try:
-                shutil.copy2(source_path, dest_path)
-                message_orm.stored_media_path = new_filename
-            except Exception:
-                logging.error(f"Failed to copy file {source_path} to {dest_path}", exc_info=True)
-        else:
-            logging.warning(f"Media file not found for message {msg_schema.id}: {source_path}")
+    _handle_media_file(message_orm, msg_schema, chat_telegram_id, export_root, media_storage_root)
 
-def load_validated_data(db: Session, chat_data: TelegramChatExportSchema, export_root: str, media_storage_root: str, batch_size: int = 1000):
-    chat, _ = get_or_create(db, Chat, telegram_id=chat_data.id, defaults={'name': chat_data.name, 'type': chat_data.type})
+
+def load_validated_data(
+    db: Session,
+    chat_data: TelegramChatExportSchema,
+    export_root: str,
+    media_storage_root: str,
+    batch_size: int = 1000
+) -> Tuple[Optional[Chat], int]:
+    """
+    Загружает валидированные данные из Pydantic-схемы в базу данных.
+    Реализует логику upsert для чатов, пользователей и сообщений.
+
+    Args:
+        db: Сессия SQLAlchemy.
+        chat_data: Pydantic-схема с данными чата.
+        export_root: Путь к директории с исходным экспортом.
+        media_storage_root: Путь к центральному хранилищу медиафайлов.
+        batch_size: Размер пакета для массовой вставки сообщений.
+
+    Returns:
+        Кортеж (chat_object, new_messages_count), где new_messages_count -
+        количество реально добавленных в БД новых сообщений.
+    """
+    chat, created = get_or_create(db, Chat, telegram_id=chat_data.id, defaults={'name': chat_data.name, 'type': chat_data.type})
+    if not created and (chat.name != chat_data.name or chat.type != chat_data.type):
+        logging.info(f"Updating metadata for chat '{chat.name}' -> '{chat_data.name}' (ID: {chat.telegram_id})")
+        chat.name = chat_data.name
+        chat.type = chat_data.type
+    
     db.flush()
     
     existing_messages_map = {m.telegram_id: m for m in db.query(Message).filter_by(chat_id=chat.id)}
     user_cache = {user.telegram_id: user for user in db.query(User)}
+    logging.info(f"Found {len(existing_messages_map)} existing messages and {len(user_cache)} users in DB for this context.")
     
     messages_to_process = []
     users_to_create = {}
@@ -242,35 +326,36 @@ def load_validated_data(db: Session, chat_data: TelegramChatExportSchema, export
     for msg_schema in chat_data.messages:
         existing_message = existing_messages_map.get(msg_schema.id)
         
-        if existing_message:
-            is_edited = msg_schema.edited and (not existing_message.edited_date or msg_schema.edited > existing_message.edited_date)
-            if is_edited:
-                logging.info(f"Updating message {msg_schema.id} due to new edit date: {msg_schema.edited}")
-                _populate_message_from_schema(
-                    existing_message, msg_schema, chat_data.id, export_root, media_storage_root
-                )
+        is_edited = msg_schema.edited and (not existing_message or not existing_message.edited_date or msg_schema.edited > existing_message.edited_date)
+        if existing_message and not is_edited:
+            continue
+        
+        if existing_message and is_edited:
+            logging.info(f"Updating message {msg_schema.id} due to new edit date: {msg_schema.edited}")
+            _populate_message_from_schema(existing_message, msg_schema, chat_data.id, export_root, media_storage_root)
             continue
         
         author_telegram_id = msg_schema.from_id
-        if author_telegram_id and author_telegram_id not in user_cache and author_telegram_id not in users_to_create:
-            users_to_create[author_telegram_id] = User(telegram_id=author_telegram_id, name=msg_schema.from_name)
+        if author_telegram_id:
+            user_in_db = user_cache.get(author_telegram_id) or users_to_create.get(author_telegram_id)
+            if user_in_db and user_in_db.name != msg_schema.from_name:
+                logging.info(f"Updating user name '{user_in_db.name}' -> '{msg_schema.from_name}' (ID: {author_telegram_id})")
+                user_in_db.name = msg_schema.from_name
+            elif not user_in_db:
+                users_to_create[author_telegram_id] = User(telegram_id=author_telegram_id, name=msg_schema.from_name)
 
-        new_message = Message(
-            telegram_id=msg_schema.id,
-            is_service=(msg_schema.type == 'service'),
-            chat_id=chat.id,
-        )
-        _populate_message_from_schema(
-            new_message, msg_schema, chat_data.id, export_root, media_storage_root
-        )
+        new_message = Message(telegram_id=msg_schema.id, is_service=(msg_schema.type == 'service'), chat_id=chat.id)
+        _populate_message_from_schema(new_message, msg_schema, chat_data.id, export_root, media_storage_root)
         messages_to_process.append((new_message, author_telegram_id))
 
     if users_to_create:
+        logging.info(f"Creating {len(users_to_create)} new users.")
         db.add_all(users_to_create.values())
         db.flush()
         for user in users_to_create.values():
             user_cache[user.telegram_id] = user
 
+    new_messages_count = 0
     messages_to_add = []
     for message, author_telegram_id in messages_to_process:
         if author_telegram_id and author_telegram_id in user_cache:
@@ -278,25 +363,52 @@ def load_validated_data(db: Session, chat_data: TelegramChatExportSchema, export
         
         messages_to_add.append(message)
         if len(messages_to_add) >= batch_size:
+            logging.info(f"Adding batch of {len(messages_to_add)} messages to session.")
             db.add_all(messages_to_add)
+            new_messages_count += len(messages_to_add)
             messages_to_add = []
             
     if messages_to_add:
+        logging.info(f"Adding final batch of {len(messages_to_add)} messages to session.")
         db.add_all(messages_to_add)
+        new_messages_count += len(messages_to_add)
 
+    logging.info(f"Committing changes to the database. Total new messages: {new_messages_count}.")
     db.commit()
-    return chat
+    return chat, new_messages_count
 
-def validate_and_load_from_dict(db: Session, raw_data: dict, export_root: str, media_storage_root: str, batch_size: int = 1000):
+def validate_and_load_from_dict(
+    db: Session,
+    raw_data: dict,
+    export_root: str,
+    media_storage_root: str,
+    batch_size: int = 1000
+) -> Tuple[Optional[Chat], int]:
+    """
+    Валидирует 'сырые' данные из JSON и запускает процесс их загрузки в БД.
+
+    Args:
+        db: Сессия SQLAlchemy.
+        raw_data: Словарь с данными из result.json.
+        export_root: Путь к директории с исходным экспортом.
+        media_storage_root: Путь к центральному хранилищу медиафайлов.
+        batch_size: Размер пакета для массовой вставки.
+
+    Returns:
+        Кортеж (chat_object, new_messages_count) или (None, 0) в случае ошибки валидации.
+    """
     try:
         validated_chat_export = TelegramChatExportSchema.model_validate(raw_data)
         return load_validated_data(db, validated_chat_export, export_root, media_storage_root, batch_size)
     except ValidationError:
         logging.error("JSON validation failed.", exc_info=True)
-        return None
+        return None, 0
 
 # --- 7. Точка входа для запуска скрипта ---
 def main(json_path: str, export_root: str):
+    """
+    Основная функция для запуска ETL-процесса для одного файла result.json.
+    """
     logging.info(f"Starting ETL process for file: {json_path}")
     
     if not os.path.exists(json_path):
@@ -310,9 +422,9 @@ def main(json_path: str, export_root: str):
     try:
         Base.metadata.create_all(bind=engine)
         
-        chat = validate_and_load_from_dict(db, raw_data, export_root, settings.MEDIA_STORAGE_ROOT)
+        chat, new_count = validate_and_load_from_dict(db, raw_data, export_root, settings.MEDIA_STORAGE_ROOT)
         if chat:
-            logging.info(f"Successfully processed data for chat: '{chat.name}' (ID: {chat.telegram_id})")
+            logging.info(f"Successfully processed data for chat: '{chat.name}' (ID: {chat.telegram_id}). Added {new_count} new messages.")
         else:
             logging.error("ETL process failed.")
     finally:
