@@ -11,3 +11,6 @@ __pycache__/
 
 # Служебные файлы pytest
 .pytest_cache/
+
+
+result.json
